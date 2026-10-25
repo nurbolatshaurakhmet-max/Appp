@@ -92,7 +92,7 @@ input:disabled{opacity:.45}
 <body>
 <div class="app">
   <div class="top">
-    <h1>NEON ARCADE</h1>
+    <h1>NEON ARCADE <small style="font-size:11px;color:var(--dim);text-shadow:none">v5</small></h1>
     <div style="display:flex;align-items:center"><div class="bal"><span id="bal">1000</span> ◆</div><button class="mute on" id="mus" aria-label="Музыка">🎵</button><button class="mute" id="mute" aria-label="Звук">🔊</button></div>
   </div>
   <nav class="tabs"><button id="tab-crash" class="on">🚀 Crash</button><button id="tab-mines">💎 Mines</button><button id="tab-up">🎁 Апгрейд</button><button id="tab-top">🏆 Топ</button><button id="tab-profile">👤 Профиль</button></nav>
@@ -160,9 +160,17 @@ input:disabled{opacity:.45}
       <input id="wd" type="number" inputmode="numeric" min="100" placeholder="Сумма" style="margin-bottom:8px">
       <button class="go" id="wdgo">Подать заявку на вывод</button>
       <div class="mmsg" id="wdmsg"></div>
+      <div class="lbl" style="text-align:center">Вывод делается в течение 8 часов.</div>
       <div class="lbl">Мои заявки</div><div id="wdlist"></div>
     </div>
-    <div class="panel" id="padmin" hidden><div class="lbl">Админ: заявки на рассмотрении</div><div id="adlist"></div></div>
+    <div class="panel" id="padmin" hidden>
+      <div class="lbl">Админ: заявки на рассмотрении</div><div id="adlist"></div>
+      <div class="lbl" style="margin-top:14px">Изменить счёт игрока</div>
+      <input id="adid" type="number" inputmode="numeric" placeholder="Telegram ID игрока" style="margin-bottom:8px">
+      <input id="adamt" type="number" inputmode="numeric" placeholder="Сумма (минус = списать)" style="margin-bottom:8px">
+      <div class="row"><button class="mc" id="adfind">Найти игрока</button><button class="mc" id="adapply">Применить</button></div>
+      <div class="mmsg" id="admsg"></div>
+    </div>
   </section>
 
   <section id="t-top" hidden>
@@ -331,7 +339,7 @@ input:disabled{opacity:.45}
   }
   function errText(e){
     var m=e&&e.message;
-    return m==='unauthorized'?((tg&&tg.initData)?'Ошибка входа: проверь BOT_TOKEN на сервере':'Открой игру через Telegram'):m==='no_balance'?'Не хватает баланса':m==='round_active'?'Раунд ещё идёт':m==='slow_down'?'Слишком часто':m==='wd_pending'?'Предыдущая заявка ещё на рассмотрении':m==='bad_amount'?'Неверная сумма':m==='forbidden'?'Нет доступа':m==='inv_full'?'Инвентарь полон':'Ошибка связи, попробуй ещё раз';
+    return m==='unauthorized'?((tg&&tg.initData)?'Ошибка входа: проверь BOT_TOKEN на сервере':'Открой игру через Telegram'):m==='no_balance'?'Не хватает баланса':m==='round_active'?'Раунд ещё идёт':m==='slow_down'?'Слишком часто':m==='wd_pending'?'Предыдущая заявка ещё на рассмотрении':m==='bad_amount'?'Неверная сумма':m==='forbidden'?'Нет доступа (админ-сессия старше часа: закрой и открой приложение)':m==='no_game'?'Не найдено':m==='inv_full'?'Инвентарь полон':'Ошибка связи, попробуй ещё раз';
   }
   function showFair(f){if(f){var t='Provably fair · hash '+f.hash.slice(0,16)+'… · nonce '+f.nonce;$('fair').textContent=t;$('fair2').textContent=t}}
   var busy=false,polling=false,lastPoll=0,rtt=0;
@@ -555,7 +563,7 @@ input:disabled{opacity:.45}
       $('padmin').hidden=!r.admin;if(r.admin)loadAdmin();
     }).catch(function(e){$('wdmsg').textContent=errText(e)});
   }
-  $('wdgo').onclick=function(){
+  $('wdgo').onclick=function(){if(tg&&tg.requestWriteAccess){try{tg.requestWriteAccess()}catch(e){}}
     var a=Math.floor(+$('wd').value),m=$('wdmsg');
     if(!(a>=100)){m.textContent='Минимум 100 ◆';m.className='mmsg l';return}
     api('/api/withdraw',{amount:a}).then(function(r){
@@ -568,7 +576,7 @@ input:disabled{opacity:.45}
       if(!rows.length){l.textContent='Нет ожидающих заявок';return}
       rows.forEach(function(w){
         var d=document.createElement('div');d.className='kv';d.style.flexWrap='wrap';d.style.gap='6px';
-        var a=document.createElement('span');a.textContent='#'+w.id+' '+(w.first_name||'')+(w.username?' @'+w.username:'')+' · ID '+w.tg_id+' · '+money(w.amount)+' ◆';
+        var a=document.createElement('span');a.textContent='#'+w.id+' '+(w.first_name||'')+(w.username?' @'+w.username:'')+' · ID '+w.tg_id+' · запросил '+money(w.amount)+' ◆ · на счету '+money(w.balance)+' ◆ · игр '+w.games+' (ставок на '+money(w.wagered)+' ◆)';
         d.appendChild(a);
         [['paid','Выплачено'],['rejected','Отклонить']].forEach(function(x){
           var b=document.createElement('button');b.className='mc';b.style.flex='none';b.textContent=x[1];
@@ -579,6 +587,18 @@ input:disabled{opacity:.45}
       });
     }).catch(function(){});
   }
+  function adMsg(t,ok){var e=$('admsg');e.textContent=t;e.className='mmsg '+(ok?'w':'l')}
+  $('adfind').onclick=function(){
+    var id=Math.floor(+$('adid').value);if(!id){adMsg('Введи Telegram ID',false);return}
+    api('/api/admin/user',{id:id}).then(function(r){
+      adMsg((r.name||'—')+(r.username?' @'+r.username:'')+' · счёт '+money(r.balance)+' ◆ · игр '+r.games+' · ставок на '+money(r.wagered)+' ◆',true);
+    }).catch(function(e){adMsg(errText(e),false)});
+  };
+  $('adapply').onclick=function(){
+    var id=Math.floor(+$('adid').value),amt=Math.trunc(+$('adamt').value);
+    if(!id||!amt){adMsg('Введи ID и сумму (не 0)',false);return}
+    api('/api/admin/balance',{id:id,amount:amt}).then(function(r){adMsg('Готово. Новый счёт: '+money(r.balance)+' ◆',true);$('adamt').value=''}).catch(function(e){adMsg(errText(e),false)});
+  };
   document.addEventListener('visibilitychange',function(){if(!document.hidden&&cd.paused)maybeCycle()});
   /* ---------- UPGRADER (gifts) ---------- */
   var UP={map:{},cat:[],items:[],sel:null,tgt:null,busy:false,rot:0};

@@ -43,7 +43,9 @@ db.exec(`CREATE TABLE IF NOT EXISTS withdrawals(
   id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER NOT NULL REFERENCES users(tg_id),
   amount INTEGER NOT NULL, status TEXT NOT NULL DEFAULT 'pending', created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL);`);
 const SIZES = [3, 5, 7, 10], MINES = [3, 4, 5, 8], EDGE = 0.97, MIN_WD = 100;
-const ADMIN_ID = Number(process.env.ADMIN_ID || 0); // your Telegram ID: enables the withdrawal-review panel
+// ADMIN_ID: your Telegram ID (several: comma separated). Admin = Telegram-signed identity + ID whitelist + fresh session.
+const ADMIN_IDS = new Set((process.env.ADMIN_ID || '').split(',').map((x) => Number(x.trim())).filter((n) => Number.isSafeInteger(n) && n > 0));
+const TZ = process.env.TIMEZONE || 'Etc/GMT-5';
 
 db.exec(`CREATE TABLE IF NOT EXISTS inventory(
   id INTEGER PRIMARY KEY AUTOINCREMENT, tg_id INTEGER NOT NULL REFERENCES users(tg_id), gift TEXT NOT NULL, created_at INTEGER NOT NULL);
@@ -62,6 +64,9 @@ const GIFTS = [
 ];
 const GIFT = Object.fromEntries(GIFTS.map((g) => [g.id, g]));
 const UP_EDGE = 0.95, SELL_RATE = 0.9, MAX_INV = 100;
+
+db.exec(`CREATE TABLE IF NOT EXISTS admin_log(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, admin_id INTEGER NOT NULL, action TEXT NOT NULL, target INTEGER, detail TEXT, ts INTEGER NOT NULL);`);
 
 const tx = (fn) => {
   db.exec('BEGIN IMMEDIATE');
@@ -107,7 +112,7 @@ function verifyInit(raw) {
   const calc = crypto.createHmac('sha256', secret).update(data).digest();
   if (!crypto.timingSafeEqual(Buffer.from(hash, 'hex'), calc)) return null;
   if (Date.now() / 1000 - Number(p.get('auth_date')) > INIT_TTL) return null;
-  try { const u = JSON.parse(p.get('user')); return Number.isSafeInteger(u.id) ? u : null; } catch { return null; }
+  try { const u = JSON.parse(p.get('user')); return Number.isSafeInteger(u.id) ? { ...u, auth_date: Number(p.get('auth_date')) } : null; } catch { return null; }
 }
 function ensureUser(u) {
   let row = getUser(u.id);
@@ -254,7 +259,7 @@ const routes = {
     const c = db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(amount),0) bet, COALESCE(SUM(payout),0) won, COALESCE(MAX(CASE WHEN status='win' THEN mult END),0) best FROM rounds WHERE tg_id=? AND amount>0 AND status!='flying'`).get(u.tg_id);
     const m = db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(amount),0) bet, COALESCE(SUM(payout),0) won, COALESCE(MAX(CASE WHEN status='win' THEN mult END),0) best FROM mines WHERE tg_id=? AND status!='active'`).get(u.tg_id);
     const w = db.prepare('SELECT id, amount, status, created_at FROM withdrawals WHERE tg_id=? ORDER BY id DESC LIMIT 10').all(u.tg_id).map((r) => ({ ...r }));
-    return { id: x.tg_id, name: x.first_name, username: x.username, since: x.created_at, balance: x.balance, crash: { ...c }, mines: { ...m }, withdrawals: w, admin: !!ADMIN_ID && x.tg_id === ADMIN_ID };
+    return { id: x.tg_id, name: x.first_name, username: x.username, since: x.created_at, balance: x.balance, crash: { ...c }, mines: { ...m }, withdrawals: w, admin: ADMIN_IDS.has(x.tg_id) };
   },
   '/api/withdraw': (u, b) => { // request only: funds are held until the request is reviewed
     const amount = b.amount;
@@ -266,22 +271,37 @@ const routes = {
       db.prepare('UPDATE users SET balance=balance-? WHERE tg_id=?').run(amount, x.tg_id);
       const id = db.prepare('INSERT INTO withdrawals(tg_id,amount,created_at,updated_at) VALUES(?,?,?,?)').run(x.tg_id, amount, Date.now(), Date.now()).lastInsertRowid;
       led(x.tg_id, -amount, 'withdraw_hold', id);
+      notifyWithdraw(id, x, amount, x.balance);
       return { balance: getUser(x.tg_id).balance, id };
     });
   },
-  '/api/admin/list': (u) => {
-    if (!ADMIN_ID || u.tg_id !== ADMIN_ID) throw new Error('forbidden');
-    return db.prepare(`SELECT w.id, w.amount, w.tg_id, x.first_name, x.username FROM withdrawals w JOIN users x ON x.tg_id=w.tg_id WHERE w.status='pending' ORDER BY w.id LIMIT 50`).all().map((r) => ({ ...r }));
+  '/api/admin/list': (u, b, t) => {
+    assertAdmin(u, t, 'list');
+    return db.prepare(`SELECT w.id, w.amount, w.tg_id, x.first_name, x.username, x.balance FROM withdrawals w JOIN users x ON x.tg_id=w.tg_id WHERE w.status='pending' ORDER BY w.id LIMIT 50`)
+      .all().map((r) => ({ ...r, ...stats(r.tg_id) }));
   },
-  '/api/admin/set': (u, b) => {
-    if (!ADMIN_ID || u.tg_id !== ADMIN_ID) throw new Error('forbidden');
+  '/api/admin/set': (u, b, t) => {
+    assertAdmin(u, t, 'set');
     if (!['paid', 'rejected'].includes(b.status) || !Number.isInteger(b.id)) throw new Error('bad_game');
+    reviewWithdrawal(b.id, b.status, u.tg_id);
+    return { ok: true };
+  },
+  '/api/admin/user': (u, b, t) => {
+    assertAdmin(u, t, 'user');
+    if (!Number.isSafeInteger(b.id)) throw new Error('bad_game');
+    const x = getUser(b.id); if (!x) throw new Error('no_game');
+    return { id: x.tg_id, name: x.first_name, username: x.username, balance: x.balance, ...stats(x.tg_id) };
+  },
+  '/api/admin/balance': (u, b, t) => { // change a player's balance (+ adds, - removes); every change is logged
+    assertAdmin(u, t, 'balance');
+    if (!Number.isSafeInteger(b.id) || !Number.isSafeInteger(b.amount) || b.amount === 0 || Math.abs(b.amount) > 1e9) throw new Error('bad_amount');
     return tx(() => {
-      const r = db.prepare(`SELECT * FROM withdrawals WHERE id=? AND status='pending'`).get(b.id);
-      if (!r) throw new Error('no_game');
-      db.prepare('UPDATE withdrawals SET status=?, updated_at=? WHERE id=?').run(b.status, Date.now(), r.id);
-      if (b.status === 'rejected') { db.prepare('UPDATE users SET balance=balance+? WHERE tg_id=?').run(r.amount, r.tg_id); led(r.tg_id, r.amount, 'withdraw_refund', r.id); }
-      return { ok: true };
+      const x = getUser(b.id); if (!x) throw new Error('no_game');
+      if (x.balance + b.amount < 0) throw new Error('bad_amount');
+      db.prepare('UPDATE users SET balance=balance+? WHERE tg_id=?').run(b.amount, x.tg_id);
+      led(x.tg_id, b.amount, 'admin_adjust', null);
+      audit(u.tg_id, 'balance', x.tg_id, `${b.amount > 0 ? '+' : ''}${b.amount} (was ${x.balance})`);
+      return { balance: getUser(x.tg_id).balance };
     });
   },
   '/api/gifts': (u) => ({
@@ -338,6 +358,73 @@ const routes = {
 };
 const KNOWN = new Set(['bad_amount', 'bad_auto', 'bad_game', 'bad_cell', 'no_game', 'forbidden', 'wd_pending', 'inv_full', 'no_balance', 'round_active', 'bad_json', 'big']);
 
+/* ---------- admin security + Telegram bot notifications ---------- */
+const audit = (admin, action, target, detail = '') =>
+  db.prepare('INSERT INTO admin_log(admin_id,action,target,detail,ts) VALUES(?,?,?,?,?)').run(admin, action, target ?? null, detail, Date.now());
+const deniedAt = new Map();
+function assertAdmin(u, t, what) { // whitelist + Telegram signature (checked earlier) + session younger than 1 hour
+  if (ADMIN_IDS.has(u.tg_id) && Date.now() / 1000 - t.auth_date < 3600) return;
+  if (Date.now() - (deniedAt.get(u.tg_id) ?? 0) > 60000) { deniedAt.set(u.tg_id, Date.now()); audit(u.tg_id, 'denied', null, what); }
+  throw new Error('forbidden');
+}
+function stats(id) {
+  const c = db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(amount),0) bet FROM rounds WHERE tg_id=? AND amount>0 AND status!='flying'`).get(id);
+  const m = db.prepare(`SELECT COUNT(*) n, COALESCE(SUM(amount),0) bet FROM mines WHERE tg_id=? AND status!='active'`).get(id);
+  const g = db.prepare('SELECT COUNT(*) n FROM upgrades WHERE tg_id=?').get(id);
+  return { games: c.n + m.n + g.n, wagered: c.bet + m.bet };
+}
+const num = (n) => Number(n).toLocaleString('ru-RU');
+const fmtDate = (ms) => new Date(ms).toLocaleString('ru-RU', { timeZone: TZ, day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit' });
+async function tgCall(method, body, ms = 10000) {
+  const r = await fetch(`https://api.telegram.org/bot${BOT_TOKEN}/${method}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body), signal: AbortSignal.timeout(ms),
+  });
+  const j = await r.json();
+  if (!j.ok) throw new Error(`${method}: ${j.description}`);
+  return j.result;
+}
+const sendSafe = (chat_id, text, extra = {}) => tgCall('sendMessage', { chat_id, text, ...extra }).catch((e) => console.error('tg send:', e.message));
+function notifyWithdraw(wid, x, amount, before) { // the bot sends the admin the player's data
+  const s = stats(x.tg_id);
+  const text = `💸 Заявка на вывод #${wid}\n\n🆔 ${x.tg_id}${x.username ? ` (@${x.username})` : ''}${x.first_name ? ` · ${x.first_name}` : ''}\n`
+    + `🎮 Сыграно игр: ${s.games} (ставок на ${num(s.wagered)} ◆)\n💵 Запросил: ${num(amount)} ◆\n`
+    + `💼 Сумма на счету: ${num(before)} ◆ (останется ${num(before - amount)} ◆)\n🕒 ${fmtDate(Date.now())}\n\nВывод делается в течение 8 часов.`;
+  const kb = { inline_keyboard: [[{ text: '✅ Выплачено', callback_data: `wd:paid:${wid}` }, { text: '❌ Отклонить', callback_data: `wd:rej:${wid}` }]] };
+  for (const id of ADMIN_IDS) sendSafe(id, text, { reply_markup: kb });
+  sendSafe(x.tg_id, `✅ Заявка #${wid} на ${num(amount)} ◆ принята.\nВывод делается в течение 8 часов.`);
+}
+function reviewWithdrawal(id, status, adminId) {
+  const w = tx(() => {
+    const r = db.prepare(`SELECT * FROM withdrawals WHERE id=? AND status='pending'`).get(id);
+    if (!r) throw new Error('no_game');
+    db.prepare('UPDATE withdrawals SET status=?, updated_at=? WHERE id=?').run(status, Date.now(), r.id);
+    if (status === 'rejected') { db.prepare('UPDATE users SET balance=balance+? WHERE tg_id=?').run(r.amount, r.tg_id); led(r.tg_id, r.amount, 'withdraw_refund', r.id); }
+    audit(adminId, `withdraw_${status}`, r.tg_id, `#${r.id} ${r.amount}`);
+    return r;
+  });
+  sendSafe(w.tg_id, status === 'paid' ? `💸 Заявка #${w.id} на ${num(w.amount)} ◆ выплачена.` : `❌ Заявка #${w.id} отклонена, ${num(w.amount)} ◆ возвращены на счёт.`);
+}
+async function handleUpdate(up) { // buttons under the admin's message
+  const cb = up.callback_query; if (!cb) return;
+  const m = /^wd:(paid|rej):(\d+)$/.exec(cb.data || ''); if (!m) return;
+  const answer = (text) => tgCall('answerCallbackQuery', { callback_query_id: cb.id, text, show_alert: true }).catch(() => {});
+  if (!ADMIN_IDS.has(cb.from.id)) { audit(cb.from.id, 'denied', null, 'bot button'); return answer('Нет доступа'); }
+  const status = m[1] === 'paid' ? 'paid' : 'rejected';
+  try { reviewWithdrawal(Number(m[2]), status, cb.from.id); } catch { return answer('Заявка уже обработана'); }
+  await answer(status === 'paid' ? 'Отмечено: выплачено' : 'Отклонено, деньги возвращены игроку');
+  if (cb.message) await tgCall('editMessageText', { chat_id: cb.message.chat.id, message_id: cb.message.message_id, text: `${cb.message.text}\n\n${status === 'paid' ? '✅ ВЫПЛАЧЕНО' : '❌ ОТКЛОНЕНО'} · ${fmtDate(Date.now())}` }).catch(() => {});
+}
+async function pollBot() {
+  await tgCall('deleteWebhook', {}).catch(() => {});
+  let offset = 0;
+  for (;;) {
+    try {
+      const ups = await tgCall('getUpdates', { offset, timeout: 25, allowed_updates: ['callback_query'] }, 35000);
+      for (const up of ups) { offset = up.update_id + 1; await handleUpdate(up).catch((e) => console.error('update:', e.message)); }
+    } catch (e) { console.error('poll:', e.message); await new Promise((r) => setTimeout(r, 4000)); }
+  }
+}
+
 /* ---------- http ---------- */
 const CSP = "default-src 'self'; script-src 'self' 'unsafe-inline' https://telegram.org; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'self' https://web.telegram.org https://webk.telegram.org https://webz.telegram.org";
 const HDR = { 'X-Content-Type-Options': 'nosniff', 'Referrer-Policy': 'no-referrer', 'Content-Security-Policy': CSP, 'Cache-Control': 'no-store' };
@@ -367,9 +454,10 @@ http.createServer(async (req, res) => {
     if (!tgUser) return send(res, 401, { error: 'unauthorized' });
     if (limited(tgUser.id)) return send(res, 429, { error: 'slow_down' });
     const body = await readBody(req);
-    send(res, 200, fn(ensureUser(tgUser), body));
+    send(res, 200, fn(ensureUser(tgUser), body, tgUser));
   } catch (e) {
     if (!KNOWN.has(e.message)) console.error(e);
     send(res, 400, { error: KNOWN.has(e.message) ? e.message : 'error' });
   }
 }).listen(PORT, () => console.log(`Neon Crash on :${PORT}`));
+if (ADMIN_IDS.size) pollBot();
